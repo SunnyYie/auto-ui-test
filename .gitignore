@@ -1,0 +1,28 @@
+
+
+# Playwright
+node_modules/
+/test-results/
+/playwright-report/
+/blob-report/
+/playwright/.cache/
+/playwright/.auth/
+
+# 指令流缓存
+/.cache/
+
+# 环境变量文件
+.env
+.env.local
+.env.*.local
+
+# ZeroStep 配置
+zerostep.config.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
