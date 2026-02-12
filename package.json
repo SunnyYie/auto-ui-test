@@ -2,6 +2,7 @@
   "name": "auto-ui-test",
   "version": "1.0.0",
   "description": "",
+  "type": "module",
   "main": "index.js",
   "scripts": {
     "test": "playwright test",
@@ -10,7 +11,7 @@
     "test:workflow": "playwright test tests/workflow/ --headed",
     "test:debug": "PWDEBUG=1 playwright test tests/workflow/",
     "test:login": "playwright test tests/login/",
-    "test:search": "playwright test tests/search/",
+    "test:case-gen": "playwright test tests/case-gen/ --headed",
     "clean:cache": "rm -rf .cache",
     "test:fresh": "rm -rf .cache && playwright test tests/workflow/ --headed"
   },
