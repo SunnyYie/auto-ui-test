@@ -11,7 +11,7 @@
     "test:workflow": "playwright test tests/workflow/ --headed",
     "test:debug": "PWDEBUG=1 playwright test tests/workflow/",
     "test:login": "playwright test tests/login/",
-    "test:case-gen": "playwright test tests/case-gen/ --headed",
+    "test:image-preview": "playwright test tests/image-preview/ --headed",
     "clean:cache": "rm -rf .cache",
     "test:fresh": "rm -rf .cache && playwright test tests/workflow/ --headed"
   },
