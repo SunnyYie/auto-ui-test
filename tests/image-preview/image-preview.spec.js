@@ -7,6 +7,12 @@
  * 需求分支: feat/image_preview
  * 核心变更: viewerjs → yet-another-react-lightbox 迁移
  *
+ * 架构集成:
+ *   基于项目统一架构 (ZeroStep AI + Playwright 混合策略):
+ *   - 使用 utils/fixture.js 提供的 { page, ai } 上下文
+ *   - 核心交互操作通过 adapter.js 执行（Playwright 优先 + AI 兜底）
+ *   - 精确 DOM/样式断言保留 Playwright 原生 API（AI 无法检查计算样式）
+ *
  * 覆盖场景:
  *   TC-1: 点击图片打开 Lightbox
  *   TC-2: 多图切换 (上一张/下一张)
@@ -26,7 +32,9 @@
  * ============================================================
  */
 
-import { test as base, expect } from '@playwright/test'
+import { test as baseTest } from '../../utils/fixture.js'
+import { expect } from '@playwright/test'
+import { executeInstruction } from '../../api/adapter.js'
 
 // ─── 常量 ───────────────────────────────────────────
 const BASE_URL = 'http://localhost:3000'
@@ -69,14 +77,10 @@ const LIGHTBOX_TIMEOUT = 5_000
 const IMAGE_LOAD_TIMEOUT = 15_000
 const NAVIGATION_TIMEOUT = 120_000
 
-// ─── 自定义 test fixture ─────────────────────────────
-const test = base.extend({
-  page: async ({ browser }, use) => {
-    const context = await browser.newContext({
-      viewport: { width: 1440, height: 900 },
-    })
-    const page = await context.newPage()
-
+// ─── 扩展 fixture: 在 AI fixture 基础上添加 CDN ORB 修复 ──────
+const test = baseTest.extend({
+  // 覆盖 page fixture，在原有 stealth 浏览器基础上追加 CDN 路由拦截
+  page: async ({ page }, use) => {
     // 修复 CDN 图片 ORB 阻止问题：拦截 i9.taou.com 的图片请求，确保响应头正确
     await page.route('**/i9.taou.com/**', async route => {
       try {
@@ -100,31 +104,111 @@ const test = base.extend({
     })
 
     await use(page)
-    await context.close()
   },
 })
+
+// ─── 适配器辅助: 通过统一指令执行浏览器操作 ──────────────────
+
+/**
+ * 通过适配器执行点击操作（Playwright 优先 + AI 兜底）
+ *
+ * @param {object} context - { page, ai } 上下文
+ * @param {string} semanticLocator - 元素语义描述（供 AI 定位）
+ * @param {string} [fallbackSelector] - CSS 选择器（供 Playwright 定位）
+ * @param {string} description - 步骤描述
+ */
+async function adapterClick(context, semanticLocator, fallbackSelector, description = '') {
+  return executeInstruction(
+    {
+      step_id: 0,
+      action_type: 'click',
+      params: { semantic_locator: semanticLocator, fallback_selector: fallbackSelector },
+      description: description || `点击 ${semanticLocator}`,
+    },
+    context,
+  )
+}
+
+/**
+ * 通过适配器执行导航操作
+ */
+async function adapterNavigate(context, url, description = '') {
+  return executeInstruction(
+    {
+      step_id: 0,
+      action_type: 'navigate',
+      params: { url },
+      description: description || `导航到 ${url}`,
+    },
+    context,
+  )
+}
+
+/**
+ * 通过适配器执行等待操作
+ */
+async function adapterWait(context, selector, timeout, description = '') {
+  return executeInstruction(
+    {
+      step_id: 0,
+      action_type: 'wait',
+      params: { selector, timeout },
+      description: description || `等待元素 ${selector}`,
+    },
+    context,
+  )
+}
+
+/**
+ * 通过适配器执行验证操作（Playwright 关键词检测 + AI 兜底）
+ */
+async function adapterVerify(context, assertion, description = '') {
+  return executeInstruction(
+    {
+      step_id: 0,
+      action_type: 'verify',
+      params: { assertion },
+      description: description || `验证 ${assertion}`,
+    },
+    context,
+  )
+}
 
 // ─── 辅助函数 ─────────────────────────────────────────
 
 /**
- * 导航到首页并等待图片缩略图加载
+ * 导航到首页并等待图片缩略图加载（通过适配器执行）
  */
-async function goHomeAndWaitForImages(page) {
-  await page.goto(HOME_URL, { waitUntil: 'networkidle' })
-  await page.waitForSelector(SEL.thumbnail, { timeout: NAVIGATION_TIMEOUT })
+async function goHomeAndWaitForImages(context) {
+  const { page } = context
+  await adapterNavigate(context, HOME_URL, '导航到首页推荐页')
+  // 等待 networkidle 确保动态内容加载完成
+  await page.waitForLoadState('networkidle')
+  await adapterWait(context, SEL.thumbnail, NAVIGATION_TIMEOUT, '等待图片缩略图加载')
 }
 
 /**
  * 打开 Lightbox：点击指定索引的缩略图
+ *
+ * 注意: 当需要点击"第 N 个"缩略图时，AI 语义定位不够精确，
+ * 因此对于 index > 0 的情况直接使用 Playwright nth 定位。
+ * 对于 index === 0 的情况，走适配器混合策略。
  */
-async function openLightbox(page, index = 0) {
-  const thumbnails = page.locator(SEL.thumbnail)
-  await thumbnails.nth(index).click()
+async function openLightbox(context, index = 0) {
+  const { page } = context
+  if (index === 0) {
+    // 第一张缩略图：通过适配器执行（Playwright 优先 + AI 兜底）
+    await adapterClick(context, 'first image thumbnail', SEL.thumbnail, '点击第一张缩略图打开 Lightbox')
+  } else {
+    // 指定索引：使用 Playwright 精确定位（AI 难以表达"第 N 个"语义）
+    await page.locator(SEL.thumbnail).nth(index).click()
+  }
   await page.waitForSelector(SEL.container, { timeout: LIGHTBOX_TIMEOUT })
 }
 
 /**
  * 获取某个缩略图所在的 ImageGallery 有多少张图
+ * (DOM 查询，无需 AI 参与)
  */
 async function getGalleryImageCount(page, thumbnailIndex) {
   return page
@@ -139,6 +223,7 @@ async function getGalleryImageCount(page, thumbnailIndex) {
 
 /**
  * 找到包含多张图片的 gallery 中的第一张缩略图索引
+ * (DOM 查询，无需 AI 参与)
  */
 async function findMultiImageGalleryIndex(page) {
   const count = await page.locator(SEL.thumbnail).count()
@@ -151,6 +236,7 @@ async function findMultiImageGalleryIndex(page) {
 
 /**
  * 找到只有单张图片的 gallery 中的缩略图索引
+ * (DOM 查询，无需 AI 参与)
  */
 async function findSingleImageGalleryIndex(page) {
   const count = await page.locator(SEL.thumbnail).count()
@@ -174,12 +260,15 @@ async function waitForImageLoaded(page) {
 // ─── 测试用例 ─────────────────────────────────────────
 
 test.describe('图片预览组件 (Lightbox)', () => {
-  test.beforeEach(async ({ page }) => {
-    await goHomeAndWaitForImages(page)
+  test.beforeEach(async ({ page, ai }) => {
+    await goHomeAndWaitForImages({ page, ai })
   })
 
-  test('TC-1: 点击图片缩略图打开 Lightbox', async ({ page }) => {
-    await openLightbox(page, 0)
+  test('TC-1: 点击图片缩略图打开 Lightbox', async ({ page, ai }) => {
+    const ctx = { page, ai }
+
+    // 通过适配器打开 Lightbox（Playwright 优先 + AI 兜底）
+    await openLightbox(ctx)
 
     // 验证 Lightbox 容器可见
     await expect(page.locator(SEL.container)).toBeVisible()
@@ -193,42 +282,36 @@ test.describe('图片预览组件 (Lightbox)', () => {
     // 验证外层固定定位容器（Portal 渲染到 body）
     await expect(page.locator(SEL.fixedOverlay)).toBeVisible()
 
-    // 验证工具栏存在（含关闭按钮）
+    // 通过适配器验证工具栏存在
+    await adapterVerify(ctx, '页面包含 "Close" 按钮', '验证关闭按钮存在')
     await expect(page.locator(SEL.closeBtn)).toBeVisible()
   })
 
-  test('TC-2: 多图切换 — 上一张/下一张', async ({ page }) => {
+  test('TC-2: 多图切换 — 上一张/下一张', async ({ page, ai }) => {
+    const ctx = { page, ai }
+
     const multiIdx = await findMultiImageGalleryIndex(page)
     test.skip(multiIdx === -1, '页面上没有多图 Feed，跳过')
 
-    await openLightbox(page, multiIdx)
+    // 打开多图 Lightbox（通过适配器，Playwright 优先 + AI 兜底）
+    await openLightbox(ctx, multiIdx)
 
     // 验证导航按钮存在
-    const nextBtn = page.locator(SEL.nextBtn)
-    const prevBtn = page.locator(SEL.prevBtn)
-    await expect(nextBtn).toBeVisible()
+    await expect(page.locator(SEL.nextBtn)).toBeVisible()
 
-    // 获取当前 carousel 的 CSS 变量 --yarl__swipe_offset（反映当前偏移量）
-    const getCarouselOffset = () =>
-      page.locator(SEL.carousel).evaluate(el => el.style.getPropertyValue('--yarl__swipe_offset'))
-
-    // 也可以通过计数器验证切换
+    // 获取当前 slide 中图片的 src
+    const getCurrentSlideSrc = () => page.locator('.yarl__slide_current .yarl__slide_image').first().getAttribute('src')
     const getCounterText = async () => {
       const counter = page.locator(SEL.counter)
-      if (await counter.isVisible()) {
-        return counter.textContent()
-      }
+      if (await counter.isVisible()) return counter.textContent()
       return null
     }
-
-    // 获取当前 slide 中图片的 src（通过 current slide 定位）
-    const getCurrentSlideSrc = () => page.locator('.yarl__slide_current .yarl__slide_image').first().getAttribute('src')
 
     const firstSrc = await getCurrentSlideSrc()
     const firstCounter = await getCounterText()
 
-    // 点击下一张
-    await nextBtn.click()
+    // 通过适配器点击"下一张"按钮（Playwright 优先 + AI 兜底）
+    await adapterClick(ctx, 'next slide navigation button', SEL.nextBtn, '点击下一张按钮')
     await page.waitForTimeout(800) // 等待切换动画完成
 
     const secondSrc = await getCurrentSlideSrc()
@@ -238,9 +321,9 @@ test.describe('图片预览组件 (Lightbox)', () => {
     const switched = firstSrc !== secondSrc || firstCounter !== secondCounter
     expect(switched).toBeTruthy()
 
-    // 点击上一张
-    await expect(prevBtn).toBeVisible()
-    await prevBtn.click()
+    // 通过适配器点击"上一张"按钮
+    await expect(page.locator(SEL.prevBtn)).toBeVisible()
+    await adapterClick(ctx, 'previous slide navigation button', SEL.prevBtn, '点击上一张按钮')
     await page.waitForTimeout(800)
 
     const backSrc = await getCurrentSlideSrc()
@@ -248,21 +331,25 @@ test.describe('图片预览组件 (Lightbox)', () => {
     expect(backSrc).toEqual(firstSrc)
   })
 
-  test('TC-3: 点击关闭按钮关闭 Lightbox', async ({ page }) => {
-    await openLightbox(page, 0)
+  test('TC-3: 点击关闭按钮关闭 Lightbox', async ({ page, ai }) => {
+    const ctx = { page, ai }
+
+    // 通过适配器打开 Lightbox
+    await openLightbox(ctx)
     await expect(page.locator(SEL.container)).toBeVisible()
 
-    // 点击关闭按钮
-    const closeBtn = page.locator(SEL.closeBtn)
-    await expect(closeBtn).toBeVisible()
-    await closeBtn.click()
+    // 通过适配器点击关闭按钮
+    await adapterClick(ctx, 'close button in the lightbox toolbar', SEL.closeBtn, '点击关闭按钮')
 
     // 等待 Lightbox 消失
     await expect(page.locator(SEL.container)).toBeHidden({ timeout: LIGHTBOX_TIMEOUT })
   })
 
-  test('TC-4: 重置按钮功能验证', async ({ page }) => {
-    await openLightbox(page, 0)
+  test('TC-4: 重置按钮功能验证', async ({ page, ai }) => {
+    const ctx = { page, ai }
+
+    // 通过适配器打开 Lightbox
+    await openLightbox(ctx)
 
     // 验证重置按钮存在且有正确的 title
     const resetBtn = page.locator(SEL.resetBtn)
@@ -274,8 +361,8 @@ test.describe('图片预览组件 (Lightbox)', () => {
     const hasSvg = await resetBtn.locator('svg').count()
     expect(hasSvg).toBeGreaterThan(0)
 
-    // 验证重置按钮可点击（不抛出错误）
-    await resetBtn.click()
+    // 通过适配器点击重置按钮
+    await adapterClick(ctx, 'reset zoom button with title 重置', SEL.resetBtn, '点击重置按钮')
     await page.waitForTimeout(300)
 
     // 点击后 Lightbox 应该仍然打开（重置不等于关闭）
@@ -283,11 +370,14 @@ test.describe('图片预览组件 (Lightbox)', () => {
     await expect(resetBtn).toBeEnabled()
   })
 
-  test('TC-5: 单图模式 — 无导航按钮、无计数器', async ({ page }) => {
+  test('TC-5: 单图模式 — 无导航按钮、无计数器', async ({ page, ai }) => {
+    const ctx = { page, ai }
+
     const singleIdx = await findSingleImageGalleryIndex(page)
     test.skip(singleIdx === -1, '页面上没有单图 Feed，跳过')
 
-    await openLightbox(page, singleIdx)
+    // 打开单图 Lightbox（通过适配器）
+    await openLightbox(ctx, singleIdx)
     await expect(page.locator(SEL.container)).toBeVisible()
 
     // 单图模式：无上一张/下一张按钮
@@ -298,10 +388,13 @@ test.describe('图片预览组件 (Lightbox)', () => {
     await expect(page.locator(SEL.counter)).toBeHidden()
   })
 
-  test('TC-6: Mac 手势防护 — overscrollBehavior & touchAction 样式', async ({ page }) => {
-    await openLightbox(page, 0)
+  test('TC-6: Mac 手势防护 — overscrollBehavior & touchAction 样式', async ({ page, ai }) => {
+    const ctx = { page, ai }
 
-    // 检查容器的关键防护样式
+    // 通过适配器打开 Lightbox
+    await openLightbox(ctx)
+
+    // 以下为精确 CSS 计算样式断言 — AI 无法检查 computedStyle，必须用 Playwright 原生 API
     const containerStyles = await page.locator(SEL.container).evaluate(el => {
       const styles = window.getComputedStyle(el)
       return {
@@ -321,12 +414,15 @@ test.describe('图片预览组件 (Lightbox)', () => {
     expect(htmlOverscrollX).toBe('none')
   })
 
-  test('TC-7: 点击背景区域关闭 Lightbox', async ({ page }) => {
-    await openLightbox(page, 0)
+  test('TC-7: 点击背景区域关闭 Lightbox', async ({ page, ai }) => {
+    const ctx = { page, ai }
+
+    // 通过适配器打开 Lightbox
+    await openLightbox(ctx)
     await expect(page.locator(SEL.container)).toBeVisible()
     await page.waitForTimeout(500)
 
-    // 点击容器边缘（远离图片的背景区域）
+    // 点击容器边缘（远离图片的背景区域）— 坐标操作需要 Playwright 原生 API
     const container = page.locator(SEL.container)
     const box = await container.boundingBox()
     if (box) {
@@ -336,16 +432,18 @@ test.describe('图片预览组件 (Lightbox)', () => {
     await expect(page.locator(SEL.container)).toBeHidden({ timeout: LIGHTBOX_TIMEOUT })
   })
 
-  test('TC-8: Lightbox 打开时锁定滚动，关闭后恢复', async ({ page }) => {
+  test('TC-8: Lightbox 打开时锁定滚动，关闭后恢复', async ({ page, ai }) => {
+    const ctx = { page, ai }
+
     // 先等待页面完全稳定
     await page.waitForTimeout(1000)
 
-    // 记录打开前 body 的 position 样式
+    // 以下为精确 DOM 样式断言 — 必须用 Playwright 原生 API
     const positionBefore = await page.evaluate(() => document.body.style.position)
     expect(positionBefore).not.toBe('fixed') // 正常状态不是 fixed
 
-    // 打开 Lightbox
-    await openLightbox(page, 0)
+    // 通过适配器打开 Lightbox
+    await openLightbox(ctx)
     await expect(page.locator(SEL.container)).toBeVisible()
 
     // 验证打开后 body 被锁定：position: fixed
@@ -356,9 +454,8 @@ test.describe('图片预览组件 (Lightbox)', () => {
     const widthDuring = await page.evaluate(() => document.body.style.width)
     expect(widthDuring).toBe('100%')
 
-    // 关闭 Lightbox
-    const closeBtn = page.locator(SEL.closeBtn)
-    await closeBtn.click()
+    // 通过适配器关闭 Lightbox
+    await adapterClick(ctx, 'close button in the lightbox toolbar', SEL.closeBtn, '点击关闭按钮')
     await expect(page.locator(SEL.container)).toBeHidden({ timeout: LIGHTBOX_TIMEOUT })
     await page.waitForTimeout(500)
 
